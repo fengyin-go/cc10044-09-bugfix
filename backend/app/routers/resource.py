@@ -94,5 +94,89 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    values = dict(payload.payload or {})
+    if payload.remark is not None:
+        values.setdefault("remark", payload.remark)
+    entry, message = service.run_action(entry_id, payload.action.strip(), values)
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/{module}/{entry_id}/execute", response_model=dict)
+def execute_pipeline(module: str, entry_id: int, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """触发流水线执行：运行记录与内部执行单一一对应。"""
+    service = require_service(module)
+    executor = getattr(service, "execute_pipeline", None)
+    if executor is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持执行")
+    values = payload or {}
+    return executor(entry_id, bool(values.get("force_full")))
+
+
+@router.post("/{module}/{entry_id}/fail", response_model=dict)
+def fail_execution(module: str, entry_id: int, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """把某轮执行标记为失败，供值班员用新失败号再次发起重跑。"""
+    service = require_service(module)
+    failer = getattr(service, "mark_execution_failed", None)
+    if failer is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持失败登记")
+    values = dict(payload or {})
+    values.setdefault("execution_id", entry_id)
+    return failer(values)
+
+
+@router.get("/{module}/{entry_id}/rerun/{failure_id}", response_model=dict)
+def get_rerun_by_failure(module: str, entry_id: int, failure_id: int) -> dict[str, Any]:
+    """按原失败号找回该轮重跑的执行与目标表写入凭据。"""
+    service = require_service(module)
+    resolver = getattr(service, "get_rerun_by_failure", None)
+    if resolver is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持重跑查询")
+    result = resolver(failure_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "未找到重跑执行"))
+    return result
+
+
+@router.post("/{module}/rerun", response_model=dict)
+def accept_rerun(module: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """受理重跑单：同一原失败号重复提交只派生一条运行记录。"""
+    service = require_service(module)
+    acceptor = getattr(service, "accept_rerun_order", None)
+    if acceptor is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持受理重跑单")
+    return acceptor(payload)
+
+
+@router.get("/{module}/{entry_id}/result", response_model=dict)
+def get_execution_result(module: str, entry_id: int) -> dict[str, Any]:
+    """查询某轮执行的结果数据写入范围与确认的数据范围。"""
+    service = require_service(module)
+    resolver = getattr(service, "get_execution_result", None)
+    if resolver is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持结果查询")
+    result = resolver(execution_id=entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "未找到执行"))
+    return result
+
+
+@router.post("/{module}/{entry_id}/confirm", response_model=dict)
+def confirm_execution(module: str, entry_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """接收 ETL 完成消息：待确认 -> 已完成，重复投递不重复记行数。"""
+    service = require_service(module)
+    confirmer = getattr(service, "confirm_write_result", None)
+    if confirmer is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持完成确认")
+    values = dict(payload)
+    values.setdefault("execution_id", entry_id)
+    return confirmer(values)
+
+
+@router.get("/{module}/{entry_id}/watermark", response_model=dict)
+def get_watermark(module: str, entry_id: int) -> dict[str, Any]:
+    """查询下一次增量抽取起点：只取已落表写入凭据的采集截止点。"""
+    service = require_service(module)
+    estimator = getattr(service, "estimate_extract_watermark", None)
+    if estimator is None:
+        raise HTTPException(status_code=404, detail=f"{module} 不支持水位线估算")
+    return estimator(entry_id)

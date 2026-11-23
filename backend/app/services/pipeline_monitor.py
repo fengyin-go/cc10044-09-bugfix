@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.services import pipeline_runtime as runtime
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -20,6 +21,57 @@ class PipelineMonitorService(BaseModuleService):
     STATUS_ORDER = ["成功", "部分成功", "执行失败", "超时终止"]
     ACTION_RULES = {"查看详情": "执行失败", "重新运行": "执行失败"}
     NEGATIVE_ACTIONS = []
+
+    def list_entries(self, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
+        """列表同样带上执行号与确认信息，刷新后与 ETL 返回一致。"""
+        rows, total = super().list_entries(**kwargs)
+        return [self._decorate(row) for row in rows], total
+
+    def _decorate(self, entry: dict[str, Any]) -> dict[str, Any]:
+        execution_id = entry.get("execution_id")
+        if execution_id is None:
+            execution = runtime.find_execution_by_monitor_run(int(entry.get("id", 0)))
+            execution_id = execution.get("id") if execution else None
+        if execution_id is None:
+            return entry
+        result = runtime.execution_result(int(execution_id))
+        if result is None:
+            return entry
+        entry["执行单号"] = result.get("execution_id")
+        entry["写入数据范围"] = result.get("written_range", "")
+        entry["确认数据范围"] = result.get("confirmed_range", "")
+        entry["确认行数"] = result.get("confirmed_rows", 0)
+        entry["确认状态"] = result.get("confirm_status", "")
+        entry["已落表"] = result.get("landed", False)
+        return entry
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        """运行历史重新进入某条记录时，带上执行号、写入范围和确认信息。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None
+        return self._decorate(entry)
+
+    def run_action(
+        self, entry_id: int, action: str, payload: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any] | None, str]:
+        """监控记录的快捷动作。
+
+        重跑必须走幂等受理入口，不能在这里再追加一条运行记录；
+        其余动作交给基类按规则流转。
+        """
+        if action == "查看详情":
+            # 详情是只读动作，不能把已成功/待确认的运行改写成失败状态。
+            entry = self.get_entry(entry_id)
+            return entry, f"已打开{self.ENTITY}详情"
+        if action == "重新运行":
+            result = self.rerun_pipeline(entry_id, **(payload or {}))
+            if not result.get("ok"):
+                return None, result.get("message", "重跑提交失败")
+            # 返回新派生的运行记录；原失败记录保持不变，只作为重跑来源。
+            new_run = store.find(self.MODULE, int(result.get("monitor_run_id")))
+            return new_run, result.get("message", "已提交重跑任务")
+        return super().run_action(entry_id, action, payload)
 
     def query_run_history(
         self, pipeline_name: str, days: int = 7, status_filter: str | None = None
@@ -38,7 +90,8 @@ class PipelineMonitorService(BaseModuleService):
         ]
         filtered.sort(key=lambda r: r.get("运行时间", ""), reverse=True)
 
-        success_count = sum(1 for r in filtered if r.get("status") == "成功")
+        success_count = sum(
+            1 for r in filtered if r.get("status") in ("成功", "已完成"))
         return {
             "pipeline_name": pipeline_name,
             "period_days": days,
@@ -50,33 +103,26 @@ class PipelineMonitorService(BaseModuleService):
             "recent_runs": filtered[:20],
         }
 
-    def rerun_pipeline(self, entry_id: int) -> dict[str, Any]:
+    def rerun_pipeline(self, entry_id: int, **options: Any) -> dict[str, Any]:
         """重新运行失败的流水线。
 
-        读取失败运行的配置参数，以相同参数重新触发。
-        日志中记录重试次数和重试原因。
+        同一个失败号（含请求超时后的重发）只派生一条重跑运行记录和一条 ETL
+        执行单，重复请求返回同一组编号；真正写目标表也只发生一次。
         """
-        entry = store.find(self.MODULE, entry_id)
-        if entry is None:
-            return {"ok": False, "message": "监控记录不存在"}
-        if entry.get("status") not in ("执行失败", "超时终止"):
-            return {"ok": False, "message": "只能重新运行失败的流水线"}
+        return runtime.create_rerun(entry_id, **options)
 
-        new_run = {
-            "id": max((int(r.get("id", 0)) for r in store.rows(self.MODULE)), default=0) + 1,
-            "流水线名称": entry.get("流水线名称"),
-            "运行时间": "2026-11-21T08:30:00Z",
-            "执行状态": "运行中",
-            "处理行数": "0",
-            "错误信息": "",
-            "status": "运行中",
-            "retry_of": entry_id,
-            "retry_reason": entry.get("错误信息", "自动重试"),
-            "pending": True,
-            "abnormal": False,
-        }
-        store.rows(self.MODULE).append(new_run)
-        return {"ok": True, "rerun_id": new_run["id"], "message": f"已提交重跑任务,新运行ID: {new_run['id']}"}
+    def get_rerun_by_failure(self, failure_id: int) -> dict[str, Any]:
+        """按原失败号找回该轮重跑的执行与结果数据写入凭据。"""
+        execution = runtime.find_execution_by_failure(failure_id)
+        if execution is None:
+            return {"ok": False, "message": "该失败号还没有对应的重跑执行"}
+        result = runtime.execution_result(int(execution["id"])) or {}
+        result["ok"] = True
+        return result
+
+    def receive_completion(self, **payload: Any) -> dict[str, Any]:
+        """接收 ETL 完成消息：待确认运行转为已完成，处理行数按消息记账。"""
+        return runtime.apply_completion(**payload)
 
     def diagnose_failures(self, entry_id: int) -> dict[str, Any]:
         """诊断流水线失败原因。
@@ -122,7 +168,8 @@ class PipelineMonitorService(BaseModuleService):
         all_runs = store.rows(self.MODULE)
         pipeline_runs = [r for r in all_runs if r.get("流水线名称") == pipeline_name]
         recent_runs = pipeline_runs[-30:] if len(pipeline_runs) > 30 else pipeline_runs
-        on_time = sum(1 for r in recent_runs if r.get("status") == "成功")
+        on_time = sum(1 for r in recent_runs
+                     if r.get("status") in ("成功", "已完成"))
         overdue = len(recent_runs) - on_time
 
         return {
@@ -150,7 +197,7 @@ class PipelineMonitorService(BaseModuleService):
             int(r.get("处理行数", "0")) for r in today_runs
             if r.get("处理行数", "").isdigit()
         )
-        success = sum(1 for r in today_runs if r.get("status") == "成功")
+        success = sum(1 for r in today_runs if r.get("status") in ("成功", "已完成"))
         return {
             "date": "2026-11-21",
             "total_runs": len(today_runs),

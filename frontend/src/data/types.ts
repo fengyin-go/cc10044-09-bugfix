@@ -18,6 +18,9 @@ export type ModuleMeta = {
   actions: string[]
   actionTargets: Record<string, string>
   metrics: string[]
+  // 指标口径：不指定时按 statuses 的第 2 项/最后一项兜底。
+  successStatuses?: string[]
+  failureStatuses?: string[]
 }
 
 export type PageResult = {

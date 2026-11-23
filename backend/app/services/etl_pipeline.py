@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services import pipeline_runtime as runtime
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -81,25 +82,88 @@ class EtlPipelineService(BaseModuleService):
     def estimate_extract_watermark(self, entry_id: int) -> dict[str, Any]:
         """估算增量抽取的水位线位置和下一次抽取范围。
 
-        水位线用于决定下一次增量抽取的起止边界，
-        避免重复拉取已处理数据或遗漏迟到数据。
+        起点只能来自目标表写入凭据里的采集截止点：失败摘要里的
+        max_watermark 只是诊断信息，未落表的执行也不能改变起点，
+        否则下一次抽取会跳过尚未写入的范围。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"error": "流水线不存在"}
-        last_run = self._last_pipeline_run(entry_id)
-        current_watermark = last_run.get("max_watermark", "") if last_run else ""
-        next_start = current_watermark or "2026-01-01T00:00:00Z"
-        lag_seconds = self._compute_watermark_lag(entry, current_watermark)
-        return {
-            "pipeline_id": entry_id,
-            "pipeline_name": entry.get("流水线名称"),
-            "last_watermark": current_watermark,
-            "next_extract_start": next_start,
-            "estimated_lag_seconds": lag_seconds,
-            "lag_category": "normal" if lag_seconds < 3600 else ("warning" if lag_seconds < 7200 else "critical"),
-            "last_run_status": last_run.get("status", "从未运行"),
-        }
+        return runtime.estimate_watermark(entry_id, entry.get("流水线名称"))
+
+    def accept_rerun_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """ETL 侧受理重跑单，并按原失败号幂等。
+
+        ETL 收到重跑单后不再另起一条运行记录：监控的重跑运行记录和执行单
+        一一对应，ETL 只在这里补写执行结果与目标表写入凭据。
+        """
+        failure_id = payload.get("failure_id", payload.get("run_id"))
+        if failure_id is None:
+            return {"ok": False, "message": "重跑单缺少原失败号 failure_id"}
+        return runtime.create_rerun(
+            int(failure_id),
+            pipeline_id=payload.get("pipeline_id"),
+            pipeline_name=payload.get("pipeline_name"),
+            row_count=int(payload.get("row_count", 10) or 10),
+            collect_cutoff=payload.get("collect_cutoff"),
+            request_id=payload.get("request_id"),
+            simulate_failure=bool(payload.get("simulate_failure")),
+        )
+
+    def get_rerun_by_failure(self, failure_id: int) -> dict[str, Any]:
+        """按原失败号找回该轮重跑的执行与目标表写入凭据。"""
+        execution = runtime.find_execution_by_failure(failure_id)
+        if execution is None:
+            return {"ok": False, "message": "该失败号还没有对应的重跑执行"}
+        result = runtime.execution_result(int(execution["id"])) or {}
+        result["ok"] = True
+        return result
+
+    def get_execution_result(
+        self,
+        execution_id: int | None = None,
+        *,
+        failure_id: int | None = None,
+        run_id: int | None = None,
+    ) -> dict[str, Any]:
+        """按重跑单查询本轮结果数据写入及确认的数据范围。"""
+        execution = runtime.find_execution(execution_id, failure_id=failure_id, run_id=run_id)
+        if execution is None:
+            return {"ok": False, "message": "未找到对应的重跑执行"}
+        result = runtime.execution_result(int(execution["id"])) or {}
+        result["ok"] = True
+        return result
+
+    def confirm_write_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """确认本轮写入结果：完成消息只记一次行数，重复投递幂等。"""
+        failure_id = payload.get("failure_id")
+        run_id = payload.get("run_id")
+        execution_id = payload.get("execution_id")
+        if failure_id is not None:
+            execution = runtime.find_execution_by_failure(int(failure_id))
+            execution_id = execution.get("id") if execution else None
+        return runtime.apply_completion(
+            int(execution_id) if execution_id is not None else None,
+            failure_id=int(failure_id) if failure_id is not None else None,
+            run_id=int(run_id) if run_id is not None else None,
+            row_count=int(payload.get("row_count", 10) or 10),
+            message_id=payload.get("message_id"),
+            confirmed_cutoff=payload.get("collect_cutoff"),
+        )
+
+    def mark_execution_failed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """ETL 把本轮执行标记为失败，后续只能用新失败号再次发起重跑。"""
+        failure_id = payload.get("failure_id")
+        execution = runtime.find_execution(
+            payload.get("execution_id"),
+            failure_id=int(failure_id) if failure_id is not None else None,
+            run_id=payload.get("run_id"),
+        )
+        return runtime.fail_execution(
+            int(execution["id"]) if execution else None,
+            reason=payload.get("reason", "重跑执行失败"),
+            summary_cutoff=payload.get("collect_cutoff"),
+        )
 
     def execute_pipeline(self, entry_id: int, force_full: bool = False) -> dict[str, Any]:
         """触发流水线执行，生成运行记录并推进水位线。
@@ -107,7 +171,8 @@ class EtlPipelineService(BaseModuleService):
         支持强制全量模式和常规增量模式：
         - force_full=True 时忽略水位线，从源端重新全量抽取
         - force_full=False 时根据已记录的水位线做增量抽取
-        执行结果写入 pipeline_monitor 模块供监控消费。
+        执行结果写入 pipeline_monitor 模块供监控消费，同时在内部执行账本
+        登记唯一一条执行单（monitor 运行记录与执行单一一对应，不再各记一条）。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
@@ -119,21 +184,62 @@ class EtlPipelineService(BaseModuleService):
         if plan is None:
             return {"ok": False, "message": "无法生成执行计划"}
 
+        name = entry.get("流水线名称", "")
+        collect_start = runtime.latest_landed_cutoff(
+            pipeline_id=entry_id, pipeline_name=name) or runtime.DEFAULT_COLLECT_START
+        collect_cutoff = runtime.DEFAULT_LANDED_CUTOFF
+        run_time = runtime.next_run_time()
+        run_id = self._next_run_id()
+
+        execution = {
+            "id": runtime.next_id(store.aux_rows(runtime.EXECUTIONS)),
+            "pipeline_id": entry_id,
+            "pipeline_name": name,
+            "target_table": runtime.target_table_name(entry, name),
+            "mode": "full" if force_full else "incremental",
+            "source_failure_id": None,
+            "status": runtime.EXEC_RUNNING,
+            "state": runtime.EXEC_RUNNING,
+            "collect_start": runtime.DEFAULT_COLLECT_START if force_full else collect_start,
+            "collect_cutoff": collect_cutoff,
+            "attempted_cutoff": collect_cutoff,
+            "row_count": 0,
+            "written_rows": 0,
+            "confirmed_rows": 0,
+            "written_range": "",
+            "confirmed_range": "",
+            "error": "",
+            "monitor_run_id": run_id,
+            "created_at": run_time,
+            "updated_at": run_time,
+        }
+        store.aux_rows(runtime.EXECUTIONS).append(execution)
+
         run_record = {
-            "id": self._next_run_id(),
-            "流水线名称": entry.get("流水线名称"),
-            "运行时间": "2026-11-21T08:00:00Z",
+            "id": run_id,
+            "流水线名称": name,
+            "运行时间": run_time,
             "执行状态": "运行中",
             "处理行数": 0,
             "错误信息": "",
-            "status": "运行中" if True else "成功",
+            "status": "运行中",
             "pipeline_id": entry_id,
-            "extract_mode": "full" if force_full else "incremental",
+            "execution_id": execution["id"],
+            "execution_status": runtime.EXEC_RUNNING,
+            "confirm_status": "未确认",
+            "collect_start": execution["collect_start"],
+            "collect_cutoff": collect_cutoff,
+            "extract_mode": execution["mode"],
             "stages_plan": plan,
         }
-        pipeline_monitor_rows = store.rows("pipeline_monitor")
-        pipeline_monitor_rows.append(run_record)
-        return {"ok": True, "message": "流水线已提交执行", "run_id": run_record["id"], "stages": len(plan["stages"])}
+        store.rows("pipeline_monitor").append(run_record)
+        return {
+            "ok": True,
+            "message": "流水线已提交执行",
+            "run_id": run_record["id"],
+            "execution_id": execution["id"],
+            "stages": len(plan["stages"]),
+        }
 
     def cross_module_snapshot(self, entry_id: int) -> dict[str, Any]:
         """跨模块消费入口：生成当前流水线的数据产物快照。
@@ -213,9 +319,6 @@ class EtlPipelineService(BaseModuleService):
             return None
         candidates.sort(key=lambda r: r.get("运行时间", ""), reverse=True)
         return candidates[0]
-
-    def _compute_watermark_lag(self, entry: dict[str, Any], current_watermark: str) -> int:
-        return 0 if not current_watermark else 300
 
     def _resolve_target_tables(self, entry: dict[str, Any]) -> list[str]:
         target = entry.get("目标端类型", "")

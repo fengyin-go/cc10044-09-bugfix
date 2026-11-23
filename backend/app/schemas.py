@@ -29,3 +29,5 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+    # 动作的业务参数（重跑的行数、采集截止点、请求号等），由领域服务解释。
+    payload: dict[str, Any] = Field(default_factory=dict)

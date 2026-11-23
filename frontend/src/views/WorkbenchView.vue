@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <a
+              v-if="meta.key === 'pipeline_monitor'"
+              class="link"
+              :data-testid="`result-${row.id}`"
+              :href="`/pipeline_monitor/${row.id}`"
+              @click.prevent="reload"
+            >
+              查看写入结果
+            </a>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -69,6 +78,25 @@
         </tr>
       </tbody>
     </table>
+
+    <section
+      v-if="meta.key === 'pipeline_monitor' && selectedRun"
+      class="detail-panel"
+      data-testid="run-detail"
+    >
+      <h3>运行详情 · #{{ selectedRun.id }}</h3>
+      <dl class="detail-grid">
+        <div><dt>执行单号</dt><dd data-testid="detail-execution">{{ selectedRun['执行单号'] ?? '—' }}</dd></div>
+        <div><dt>执行状态</dt><dd data-testid="detail-status">{{ selectedRun.status }}</dd></div>
+        <div><dt>确认状态</dt><dd data-testid="detail-confirm">{{ selectedRun['确认状态'] ?? '—' }}</dd></div>
+        <div><dt>处理行数</dt><dd data-testid="detail-rows">{{ selectedRun['处理行数'] ?? '0' }}</dd></div>
+        <div><dt>写入数据范围</dt><dd data-testid="detail-written">{{ selectedRun['写入数据范围'] || '—' }}</dd></div>
+        <div><dt>确认数据范围</dt><dd data-testid="detail-confirmed">{{ selectedRun['确认数据范围'] || '—' }}</dd></div>
+      </dl>
+      <button class="btn ghost" data-testid="detail-close" type="button" @click="selectedRun = null">
+        关闭详情
+      </button>
+    </section>
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -105,7 +133,7 @@ import {
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
-const props = defineProps<{ moduleKey: string }>()
+const props = defineProps<{ moduleKey: string; runId?: string }>()
 const meta = moduleMeta(props.moduleKey)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
@@ -115,14 +143,24 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const selectedRun = ref<EntryRow | null>(null)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
-  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
+  {
+    label: meta.metrics[1],
+    value: rows.value.filter((row) => successStatuses.value.includes(String(row.status))).length,
+  },
   {
     label: meta.metrics[2],
-    value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
+    value: rows.value.filter((row) => failureStatuses.value.includes(String(row.status))).length,
   },
 ])
+const successStatuses = computed(
+  () => meta.successStatuses ?? [meta.statuses[1], '已完成'],
+)
+const failureStatuses = computed(
+  () => meta.failureStatuses ?? [meta.statuses[meta.statuses.length - 1], '执行失败', '超时终止'],
+)
 const statusSummary = computed(() =>
   meta.statuses.map((status) => ({
     status,
@@ -171,6 +209,7 @@ async function runAction(action: string, row: EntryRow) {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
     await reload()
+    selectedRun.value = rows.value.find((item) => Number(item.id) === Number(row.id)) ?? null
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
@@ -187,5 +226,15 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+// 运行历史重新进入某条记录时，按 id 打开详情并与后端刷新后的值对齐。
+function selectRunById(runId: string | null) {
+  if (!runId || meta.key !== 'pipeline_monitor') return
+  selectedRun.value = rows.value.find((row) => String(row.id) === runId) ?? null
+}
+
+onMounted(async () => {
+  await reload()
+  const routeRun = props.runId ?? window.location.pathname.match(/^\/[^/]+\/(\d+)$/)?.[1] ?? null
+  selectRunById(routeRun ?? null)
+})
 </script>

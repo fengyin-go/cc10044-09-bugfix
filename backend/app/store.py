@@ -14,12 +14,25 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 内部账本（ETL 执行单、目标表写入凭证等）不属于业务模块，
+        # 不参与模块清单/概览统计，避免内部簿记改变页面上的模块数量。
+        self._aux_tables: dict[str, list[dict[str, Any]]] = {}
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
+
+    def aux_rows(self, name: str) -> list[dict[str, Any]]:
+        """内部账本访问入口：跨服务共享但不暴露为业务模块。"""
+        return self._aux_tables.setdefault(name, [])
+
+    def aux_find(self, name: str, entry_id: int) -> dict[str, Any] | None:
+        for row in self.aux_rows(name):
+            if int(row.get("id", 0)) == entry_id:
+                return row
+        return None
 
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):
